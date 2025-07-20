@@ -21,14 +21,13 @@ namespace create_manifest
             Console.WriteLine("Stap 1: Ophalen metadata uit Dataverse en opslaan als solution-export.json");
             await ExportDataverseMetadataAsync();
 
-            Console.WriteLine("Stap 2: Manifest maken vanuit solution-export.json");
-            await CreateManifestAsync();
+            //Console.WriteLine("Stap 2: Manifest maken vanuit solution-export.json");
+            //await CreateManifestAsync();
         }
 
         private static async Task ExportDataverseMetadataAsync()
         {
-            string connectionString = "AuthType=OAuth;Url=https://yourorg.crm.dynamics.com;ClientId=xxxx;ClientSecret=xxxx;TenantId=xxxx;";
-
+            string connectionString = "AuthType=ClientSecret;Url=https://vlavirgemdev.crm4.dynamics.com;clientid=x;clientsecret=x;tenantid=x;";
             var serviceClient = new ServiceClient(connectionString);
             if (!serviceClient.IsReady)
             {
