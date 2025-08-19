@@ -9,6 +9,7 @@ namespace create_manifest
     using Microsoft.CommonDataModel.ObjectModel.Utilities;
     using Microsoft.PowerPlatform.Dataverse.Client;
     using Newtonsoft.Json;
+    using Newtonsoft.Json.Linq;
     using System;
     using System.Collections.Generic;
     using System.IO;
@@ -18,16 +19,21 @@ namespace create_manifest
     {
         static async Task Main(string[] args)
         {
-            Console.WriteLine("Stap 1: Ophalen metadata uit Dataverse en opslaan als solution-export.json");
-            await ExportDataverseMetadataAsync();
+            //Console.WriteLine("Stap 1: Ophalen metadata uit Dataverse en opslaan als solution-export.json");
+            //await ExportDataverseMetadataAsync();
 
-            //Console.WriteLine("Stap 2: Manifest maken vanuit solution-export.json");
-            //await CreateManifestAsync();
+            Console.WriteLine("Stap 2: Manifest maken vanuit solution-export.json");
+            string inputPath = @"C:\Users\IllyaVerheyden\Desktop\CDM\solution-export.json";
+            string outputDir = @"C:\Users\IllyaVerheyden\Desktop\CDM\samples\2-create-manifest\code-cs\cdm-out";
+
+            GenerateCdmFromSolutionExport(inputPath, outputDir);
+
+            Console.WriteLine("CDM bestanden zijn gegenereerd!");
         }
 
         private static async Task ExportDataverseMetadataAsync()
         {
-            string connectionString = "AuthType=ClientSecret;Url=https://vlavirgemdev.crm4.dynamics.com;clientid=x;clientsecret=x;tenantid=x;";
+            string connectionString = "ph";
             var serviceClient = new ServiceClient(connectionString);
             if (!serviceClient.IsReady)
             {
@@ -78,87 +84,112 @@ namespace create_manifest
             Console.WriteLine("Metadata geëxporteerd naar solution-export.json");
         }
 
-        private static async Task CreateManifestAsync()
+        static void GenerateCdmFromSolutionExport(string inputPath, string outputDir)
         {
-            var cdmCorpus = new CdmCorpusDefinition();
+            var json = JObject.Parse(File.ReadAllText(inputPath));
+            var entities = (JArray)json["Entities"]!;
 
-            cdmCorpus.SetEventCallback(new EventCallback
+            var manifest = new JObject
             {
-                Invoke = (level, message) =>
+                ["manifestName"] = "default",
+                ["jsonSchemaSemanticVersion"] = "1.0.0",
+                ["entities"] = new JArray(),
+                ["imports"] = new JArray
                 {
-                    Console.WriteLine(message);
+                    new JObject { ["corpusPath"] = "cdm:/core/cdsConcepts.cdm.json" },
+                    new JObject { ["corpusPath"] = "cdm:/foundations.cdm.json" }
                 }
-            }, CdmStatusLevel.Warning);
+            };
 
-            Console.WriteLine("Configure storage adapters");
-
-            string pathFromExeToExampleRoot = "../../../../../../";
-
-            cdmCorpus.Storage.Mount("local", new LocalAdapter(pathFromExeToExampleRoot + "2-create-manifest/sample-data"));
-            cdmCorpus.Storage.DefaultNamespace = "local";
-
-            cdmCorpus.Storage.Mount("cdm", new LocalAdapter(pathFromExeToExampleRoot + "example-public-standards"));
-
-            Console.WriteLine("Lees solution-export.json in");
-            string solutionJson = File.ReadAllText("solution-export.json");
-            var solution = JsonConvert.DeserializeObject<SolutionExport>(solutionJson);
-
-            Console.WriteLine("Maak placeholder manifest");
-            CdmManifestDefinition manifestAbstract = cdmCorpus.MakeObject<CdmManifestDefinition>(CdmObjectType.ManifestDef, "tempAbstract");
-
-            // Dynamisch toevoegen van entities op basis van solution-export.json
-            foreach (var entity in solution.Entities)
+            foreach (var entityNode in entities)
             {
-                string entityName = entity.LogicalName;
+                string logicalName = entityNode["LogicalName"]!.ToString();
+                string entityName = char.ToUpper(logicalName[0]) + logicalName[1..];
 
-                // Pas dit pad aan als jouw CDM schema’s elders staan
-                string cdmPath = $"cdm:/core/applicationCommon/foundationCommon/crmCommon/accelerators/healthCare/electronicMedicalRecords/{entityName}.cdm.json/{entityName}";
+                var attrs = new JArray();
+                var csvHeader = "";
 
-                manifestAbstract.Entities.Add(entityName, cdmPath);
+                foreach (var attr in (JArray)entityNode["Attributes"]!)
+                {
+                    string name = attr["Name"]!.ToString();
+                    string type = attr["Type"]?.ToString() ?? "String";
+                    string cdmType = MapToCdmType(type);
+
+                    attrs.Add(new JObject
+                    {
+                        ["name"] = name,
+                        ["dataType"] = cdmType
+                    });
+
+                    csvHeader += name + ",";
+                }
+                if (csvHeader.EndsWith(",")) csvHeader = csvHeader.TrimEnd(',');
+
+                // Entity JSON
+                var entityDoc = new JObject
+                {
+                    ["$schema"] = "../schema.cdm.json",
+                    ["jsonSchemaSemanticVersion"] = "1.0.0",
+                    ["imports"] = new JArray(
+                        new JObject { ["corpusPath"] = "cdm:/foundations.cdm.json" }
+                    ),
+                    ["definitions"] = new JArray(new JObject
+                    {
+                        ["entityName"] = entityName,
+                        ["extendsEntity"] = new JObject { ["entityReference"] = "CdmEntity" },
+                        ["hasAttributes"] = attrs
+                    })
+                };
+
+                string entityFile = Path.Combine(outputDir, $"{entityName}.cdm.json");
+                File.WriteAllText(entityFile, JsonConvert.SerializeObject(entityDoc, Formatting.Indented));
+
+                // Data folder + CSV
+                string entityFolder = Path.Combine(outputDir, entityName);
+                Directory.CreateDirectory(entityFolder);
+                string csvPath = Path.Combine(entityFolder, "partition-data.csv");
+                File.WriteAllText(csvPath, csvHeader + Environment.NewLine); // enkel headers
+
+                // Manifest entry
+                ((JArray)manifest["entities"]!).Add(new JObject
+                {
+                    ["type"] = "LocalEntity",
+                    ["entityName"] = entityName,
+                    ["entityPath"] = $"{entityName}.cdm.json/{entityName}",
+                    ["dataPartitions"] = new JArray(new JObject
+                    {
+                        ["name"] = $"{entityName}Partition",
+                        ["location"] = $"{entityName}/partition-data.csv",
+                        ["traits"] = new JArray(new JObject
+                        {
+                            ["traitReference"] = "is.partition.format.CSV",
+                            ["arguments"] = new JArray(
+                                new JObject { ["name"] = "columnHeaders", ["value"] = "true" },
+                                new JObject { ["name"] = "delimiter", ["value"] = "," }
+                            )
+                        })
+                    })
+                });
             }
 
-            var localRoot = cdmCorpus.Storage.FetchRootFolder("local");
-            localRoot.Documents.Add(manifestAbstract);
-
-            Console.WriteLine("Resolve the placeholder");
-            var manifestResolved = await manifestAbstract.CreateResolvedManifestAsync("default", "");
-
-            manifestResolved.Imports.Add("cdm:/foundations.cdm.json");
-
-            Console.WriteLine("Save the documents");
-            foreach (CdmEntityDeclarationDefinition eDef in manifestResolved.Entities)
-            {
-                var entDef = await cdmCorpus.FetchObjectAsync<CdmEntityDefinition>(eDef.EntityPath, manifestResolved);
-
-                var part = cdmCorpus.MakeObject<CdmDataPartitionDefinition>(CdmObjectType.DataPartitionDef, $"{entDef.EntityName}-data-description");
-                eDef.DataPartitions.Add(part);
-                part.Explanation = "not real data, just for demo";
-
-                var location = $"local:/{entDef.EntityName}/partition-data.csv";
-                part.Location = cdmCorpus.Storage.CreateRelativeCorpusPath(location, manifestResolved);
-
-                var csvTrait = part.ExhibitsTraits.Add("is.partition.format.CSV", false) as CdmTraitReference;
-                csvTrait.Arguments.Add("columnHeaders", "true");
-                csvTrait.Arguments.Add("delimiter", ",");
-
-                string partPath = cdmCorpus.Storage.CorpusPathToAdapterPath(location);
-
-                string header = "";
-                foreach (CdmTypeAttributeDefinition att in entDef.Attributes)
-                {
-                    if (header != "")
-                        header += ",";
-                    header += att.Name;
-                }
-
-                Directory.CreateDirectory(cdmCorpus.Storage.CorpusPathToAdapterPath($"local:/{entDef.EntityName}"));
-                File.WriteAllText(partPath, header);
-            }
-
-            await manifestResolved.SaveAsAsync($"{manifestResolved.ManifestName}.manifest.cdm.json", true);
-
-            Console.WriteLine("Manifest creatie afgerond.");
+            string manifestFile = Path.Combine(outputDir, "default.manifest.cdm.json");
+            File.WriteAllText(manifestFile, JsonConvert.SerializeObject(manifest, Formatting.Indented));
         }
+
+        static string MapToCdmType(string dvType) => dvType switch
+        {
+            "Uniqueidentifier" => "string",
+            "String" => "string",
+            "Memo" => "string",
+            "Integer" => "integer",
+            "BigInt" => "integer",
+            "Double" => "double",
+            "Decimal" => "decimal",
+            "Money" => "decimal",
+            "Boolean" => "boolean",
+            "DateTime" => "dateTime",
+            _ => "string"
+        };
     }
 
     // Zet deze classes eventueel apart in een eigen file / project
@@ -173,7 +204,6 @@ namespace create_manifest
         public string LogicalName { get; set; }
         public List<SolutionAttribute> Attributes { get; set; }
     }
-
     public class SolutionAttribute
     {
         public string Name { get; set; }
