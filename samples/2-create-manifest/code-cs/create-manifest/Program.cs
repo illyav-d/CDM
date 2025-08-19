@@ -14,10 +14,17 @@ namespace create_manifest
 
     class Program
     {
-        //Padbestanden en config todo: van hardcoded naar /.../... paths
-        private const string BaseOutputRoot = @"C:\Users\IllyaVerheyden\Desktop\CDM\samples\2-create-manifest\code-cs\cdm-out";
-        private const string SchemaFilesSource = @"C:\Users\IllyaVerheyden\Desktop\CDM\samples\2-create-manifest\code-cs\needed-files";
+        // Padbestanden en config (TODO: van hardcoded naar config/args indien gewenst)
+
+        private static readonly string ProjectRoot = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "..", "..",".."));
+
+        //Mappen
+        private static readonly string BaseOutputRoot = Path.Combine(ProjectRoot, "cdm-out");
+        private static readonly string SchemaFilesSource = Path.Combine(ProjectRoot, "needed-files");
         private const string SchemaVersion = "1.1.0";
+
+
+        // Leveranciers (prefix, label)
         static readonly List<(string Prefix, string Label)> Suppliers = new()
         {
             ("nrq",  "Norriq"),
@@ -30,7 +37,13 @@ namespace create_manifest
 
         static async Task Main(string[] args)
         {
-            // --- Stap 1: Kiezen wat we exporteren 
+            Console.WriteLine("Mappencontrole...");
+            Console.WriteLine($"ProjectRoot: {ProjectRoot}");
+            Console.WriteLine($"BaseOutputRoot: {BaseOutputRoot}");
+            Console.WriteLine($"SchemaFilesSource: {SchemaFilesSource}");
+            Console.WriteLine();
+
+            // --- Stap 1: Keuze menu ---
             Console.WriteLine("Stap 1: Ophalen metadata uit Dataverse en wegschrijven (gefilterd)");
             Console.WriteLine("Kies wat je wil exporteren:");
             Console.WriteLine("  1) Alle entiteiten");
@@ -40,12 +53,13 @@ namespace create_manifest
 
             var key = Console.ReadKey(); Console.WriteLine();
             int choice = char.IsDigit(key.KeyChar) ? (key.KeyChar - '0') : 1;
+            Console.WriteLine();
 
             string? prefix = null;
             string suffix;
             if (choice == 1)
             {
-                prefix = null;      // alles
+                prefix = null; // alles
                 suffix = "all";
             }
             else
@@ -67,14 +81,14 @@ namespace create_manifest
             string outDir = Path.Combine(BaseOutputRoot, suffix);
             EnsureEmptyDirectory(outDir);
 
-            // Copy foundations + cdsConcepts naar output-submap
+            // foundations + cdsConcepts kopiëren
             CopySchemaFilesTo(outDir);
 
             // Bestandsnaam voor gefilterde export
             string exportPath = Path.Combine(outDir, $"entities-{suffix}.json");
 
             // --- Stap 1: Exporteren met filter (prefix of alles) ---
-            string connectionString = "";
+            string connectionString = PromptConnectionStringIfEmpty(""); // leeg laten → vraagt in console
             bool ok = await ExportDataverseMetadataAsync(connectionString, prefix, exportPath);
             if (!ok)
             {
@@ -85,11 +99,12 @@ namespace create_manifest
             // --- Stap 2: CDM genereren op basis van die gefilterde export ---
             Console.WriteLine("Stap 2: Manifest maken vanuit gefilterde export");
             GenerateCdmFromSolutionExport(exportPath, outDir, SchemaVersion);
-
+            Console.WriteLine();
             Console.WriteLine($"Klaar. Bestanden in: {outDir}");
+            Console.WriteLine();
         }
 
-        
+        // Zorgt dat een map leeg is (verwijdert indien aanwezig, maakt opnieuw aan).
         private static void EnsureEmptyDirectory(string path)
         {
             if (Directory.Exists(path))
@@ -99,9 +114,24 @@ namespace create_manifest
             }
             Directory.CreateDirectory(path);
             Console.WriteLine($"Nieuwe map aangemaakt: {path}");
+            Console.WriteLine();
+        }
+
+        // Interactieve prompt als je de connection string niet hard meegeeft
+        private static string PromptConnectionStringIfEmpty(string connectionString)
+        {
+            if (!string.IsNullOrWhiteSpace(connectionString))
+                return connectionString.Trim();
+
+            Console.Write("Dataverse connection string (wordt niet opgeslagen): ");
+            var entered = Console.ReadLine()?.Trim() ?? "";
+            if (string.IsNullOrWhiteSpace(entered))
+                throw new InvalidOperationException("Geen connection string opgegeven.");
+            return entered;
         }
 
         /// Exporteert Dataverse metadata en filtert meteen op prefix (of alles).
+        /// Neemt ook relaties (1:N / N:1) mee in de export.
         private static async Task<bool> ExportDataverseMetadataAsync(string connectionString, string? prefixFilter, string exportPath)
         {
             var serviceClient = new ServiceClient(connectionString);
@@ -111,38 +141,31 @@ namespace create_manifest
                 return false;
             }
             Console.WriteLine("Verbinding met Dataverse succesvol.");
+            Console.WriteLine();
 
             var solutionExport = new SolutionExport
             {
                 SolutionName = prefixFilter is null ? "All" : prefixFilter,
-                Entities = new List<SolutionEntity>()
+                Entities = new List<SolutionEntity>(),
+                Relationships = new List<SolutionRelationship>()
             };
 
             var request = new Microsoft.Xrm.Sdk.Messages.RetrieveAllEntitiesRequest()
             {
-                EntityFilters = Microsoft.Xrm.Sdk.Metadata.EntityFilters.Entity | Microsoft.Xrm.Sdk.Metadata.EntityFilters.Attributes,
+                EntityFilters = Microsoft.Xrm.Sdk.Metadata.EntityFilters.Entity | Microsoft.Xrm.Sdk.Metadata.EntityFilters.Attributes | Microsoft.Xrm.Sdk.Metadata.EntityFilters.Relationships,
                 RetrieveAsIfPublished = true
             };
             var response = (Microsoft.Xrm.Sdk.Messages.RetrieveAllEntitiesResponse)serviceClient.Execute(request);
 
             int total = 0, matched = 0;
 
+            // --- Entities + attributes ---
             foreach (var entityMetadata in response.EntityMetadata)
             {
                 total++;
-
                 string ln = entityMetadata.LogicalName ?? string.Empty;
 
-                bool include = true;
-                if (!string.IsNullOrWhiteSpace(prefixFilter))
-                {
-                    // Robuuste match: zowel "nrq" als "nrq_"
-                    include =
-                        ln.StartsWith(prefixFilter, StringComparison.OrdinalIgnoreCase) ||
-                        ln.StartsWith(prefixFilter + "_", StringComparison.OrdinalIgnoreCase);
-                }
-
-                if (!include) continue;
+                if (!IncludeByPrefix(prefixFilter, ln)) continue;
 
                 matched++;
 
@@ -159,11 +182,55 @@ namespace create_manifest
                 solutionExport.Entities.Add(new SolutionEntity
                 {
                     LogicalName = ln,
+                    PrimaryId = entityMetadata.PrimaryIdAttribute ?? "",
                     Attributes = attributes
                 });
             }
 
-            // log aantallen + een paar namen
+            // --- Relationships (1:N en N:1) ---
+            foreach (var em in response.EntityMetadata)
+            {
+                foreach (var rel in em.OneToManyRelationships ?? Array.Empty<Microsoft.Xrm.Sdk.Metadata.OneToManyRelationshipMetadata>())
+                {
+                    string referencingEntity = rel.ReferencingEntity ?? "";
+                    string referencedEntity = rel.ReferencedEntity ?? "";
+                    string fkAttr = rel.ReferencingAttribute ?? "";
+                    string pkAttr = rel.ReferencedAttribute ?? "";
+                    string schemaName = rel.SchemaName ?? $"{referencingEntity}_{referencedEntity}";
+
+                    if (!IncludeByPrefix(prefixFilter, referencingEntity)) continue;
+
+                    solutionExport.Relationships.Add(new SolutionRelationship
+                    {
+                        Name = schemaName,
+                        FromEntity = referencingEntity,
+                        FromAttribute = fkAttr,
+                        ToEntity = referencedEntity,
+                        ToAttribute = pkAttr
+                    });
+                }
+
+                foreach (var rel in em.ManyToOneRelationships ?? Array.Empty<Microsoft.Xrm.Sdk.Metadata.OneToManyRelationshipMetadata>())
+                {
+                    string referencingEntity = rel.ReferencingEntity ?? "";
+                    string referencedEntity = rel.ReferencedEntity ?? "";
+                    string fkAttr = rel.ReferencingAttribute ?? "";
+                    string pkAttr = rel.ReferencedAttribute ?? "";
+                    string schemaName = rel.SchemaName ?? $"{referencingEntity}_{referencedEntity}";
+
+                    if (!IncludeByPrefix(prefixFilter, referencingEntity)) continue;
+
+                    solutionExport.Relationships.Add(new SolutionRelationship
+                    {
+                        Name = schemaName,
+                        FromEntity = referencingEntity,
+                        FromAttribute = fkAttr,
+                        ToEntity = referencedEntity,
+                        ToAttribute = pkAttr
+                    });
+                }
+            }
+
             Console.WriteLine($"Gefilterd op prefix: {(prefixFilter ?? "<all>")}");
             Console.WriteLine($"Totaal entiteiten: {total} | Geselecteerd: {matched}");
             if (matched > 0)
@@ -173,6 +240,8 @@ namespace create_manifest
                 for (int i = 0; i < show; i++)
                     Console.WriteLine($"  - {solutionExport.Entities[i].LogicalName}");
             }
+            Console.WriteLine($"Relaties verzameld: {solutionExport.Relationships.Count}");
+            Console.WriteLine();
 
             if (solutionExport.Entities.Count == 0)
             {
@@ -182,21 +251,24 @@ namespace create_manifest
 
             string json = JsonConvert.SerializeObject(solutionExport, Formatting.Indented);
             File.WriteAllText(exportPath, json);
-            Console.WriteLine($"Metadata geëxporteerd naar {exportPath}");
+            Console.WriteLine($"Metadata (incl. relaties) geëxporteerd naar {exportPath}");
             return true;
         }
 
         /// Leest de (gefilterde) JSON en genereert CDM: *.cdm.json, partitions en manifest.
+        /// Schrijft ook manifest.relationships zodat SchemaViz relaties tekent.
         private static void GenerateCdmFromSolutionExport(string inputPath, string outputDir, string schemaVersion)
         {
             var json = JObject.Parse(File.ReadAllText(inputPath));
             var entities = (JArray)json["Entities"]!;
+            var rels = (JArray?)json["Relationships"];
 
             var manifest = new JObject
             {
                 ["manifestName"] = "default",
                 ["jsonSchemaSemanticVersion"] = schemaVersion,
                 ["entities"] = new JArray(),
+                ["relationships"] = new JArray(),
                 ["imports"] = new JArray
                 {
                     new JObject { ["corpusPath"] = "cdm:/core/cdsConcepts.cdm.json" },
@@ -204,12 +276,31 @@ namespace create_manifest
                 }
             };
 
+            var fkLookup = new Dictionary<(string entity, string attr), (string toEntity, string toAttr)>(
+                new TupleStringIgnoreCaseComparer()
+            );
+            if (rels != null)
+            {
+                foreach (var r in rels)
+                {
+                    var fe = r["FromEntity"]?.ToString() ?? "";
+                    var fa = r["FromAttribute"]?.ToString() ?? "";
+                    var te = r["ToEntity"]?.ToString() ?? "";
+                    var ta = r["ToAttribute"]?.ToString() ?? "";
+                    if (!string.IsNullOrWhiteSpace(fe) && !string.IsNullOrWhiteSpace(fa) &&
+                        !string.IsNullOrWhiteSpace(te) && !string.IsNullOrWhiteSpace(ta))
+                    {
+                        fkLookup[(fe, fa)] = (te, ta);
+                    }
+                }
+            }
+
             foreach (var entityNode in entities)
             {
                 string logicalName = entityNode["LogicalName"]!.ToString();
                 string entityName = ToPascal(logicalName);
+                string primaryId = (entityNode["PrimaryId"]?.ToString() ?? "").Trim();
 
-                // === Attributes ===
                 var attrs = new JArray();
                 var csvHeader = new StringBuilder();
 
@@ -219,47 +310,89 @@ namespace create_manifest
                     string type = attr["Type"]?.ToString() ?? "String";
                     string cdmType = MapToCdmType(type);
 
-                    // CDM: dataType als object met dataTypeReference
-                    attrs.Add(new JObject
+                    JArray? attrTraits = null;
+
+                    // FK-trait (sample-vorm met entityGroupSet/constantValues)
+                    if (fkLookup.TryGetValue((logicalName, name), out var target))
+                    {
+                        string toEntityPascal = ToPascal(target.toEntity);
+                        string targetPath = $"{toEntityPascal}.cdm.json/{toEntityPascal}";
+                        string targetPk = string.IsNullOrWhiteSpace(target.toAttr) ? "id" : target.toAttr;
+
+                        attrTraits ??= new JArray();
+                        attrTraits.Add(
+                            new JObject
+                            {
+                                ["traitReference"] = "is.linkedEntity.identifier",
+                                ["arguments"] = new JArray(
+                                    new JObject
+                                    {
+                                        ["entityReference"] = new JObject
+                                        {
+                                            ["entityShape"] = "entityGroupSet",
+                                            ["constantValues"] = new JArray(
+                                                new JArray(targetPath, targetPk)
+                                            )
+                                        }
+                                    }
+                                )
+                            }
+                        );
+                    }
+
+                    // PK-trait op attribuut
+                    if (!string.IsNullOrWhiteSpace(primaryId) &&
+                        string.Equals(name, primaryId, StringComparison.OrdinalIgnoreCase))
+                    {
+                        attrTraits ??= new JArray();
+                        attrTraits.Add(new JObject { ["traitReference"] = "means.identity.entityId" });
+                    }
+
+                    var attrObj = new JObject
                     {
                         ["name"] = name,
                         ["dataType"] = new JObject { ["dataTypeReference"] = cdmType }
-                    });
+                    };
+                    if (attrTraits != null && attrTraits.Count > 0)
+                    {
+                        // BELANGRIJK: appliedTraits ipv exhibitsTraits
+                        attrObj["appliedTraits"] = attrTraits;
+                    }
+
+                    attrs.Add(attrObj);
 
                     if (csvHeader.Length > 0) csvHeader.Append(',');
                     csvHeader.Append(name);
                 }
 
-                // === Entity JSON ===
+                var entityDef = new JObject
+                {
+                    ["entityName"] = entityName,
+                    ["extendsEntity"] = new JObject { ["entityReference"] = "CdmEntity" },
+                    ["hasAttributes"] = attrs
+                };
+
                 var entityDoc = new JObject
                 {
                     ["$schema"] = "cdm:/schema.cdm.json",
                     ["jsonSchemaSemanticVersion"] = schemaVersion,
                     ["imports"] = new JArray(new JObject { ["corpusPath"] = "cdm:/foundations.cdm.json" }),
-                    ["definitions"] = new JArray(new JObject
-                    {
-                        ["entityName"] = entityName,
-                        ["extendsEntity"] = new JObject { ["entityReference"] = "CdmEntity" },
-                        ["hasAttributes"] = attrs
-                    })
+                    ["definitions"] = new JArray(entityDef)
                 };
 
-                // Schrijf <Entity>.cdm.json
                 string entityFile = Path.Combine(outputDir, $"{entityName}.cdm.json");
                 File.WriteAllText(entityFile, JsonConvert.SerializeObject(entityDoc, Formatting.Indented));
 
-                // === Partition CSV + folder ===
                 string entityFolder = Path.Combine(outputDir, entityName);
                 Directory.CreateDirectory(entityFolder);
                 string csvPath = Path.Combine(entityFolder, "partition-data.csv");
                 File.WriteAllText(csvPath, csvHeader.ToString() + Environment.NewLine);
 
-                // === Manifest entry ===
                 var partition = new JObject
                 {
                     ["name"] = $"{entityName}-data-description",
                     ["location"] = $"{entityName}/partition-data.csv",
-                    ["exhibitsTraits"] = new JArray(new JObject
+                    ["appliedTraits"] = new JArray(new JObject
                     {
                         ["traitReference"] = "is.partition.format.CSV",
                         ["arguments"] = new JArray(
@@ -278,12 +411,45 @@ namespace create_manifest
                 });
             }
 
-            // Manifest opslaan
+            if (rels != null)
+            {
+                foreach (var r in rels)
+                {
+                    string fromEntityLogical = r["FromEntity"]?.ToString() ?? "";
+                    string toEntityLogical = r["ToEntity"]?.ToString() ?? "";
+                    string fromAttribute = r["FromAttribute"]?.ToString() ?? "";
+                    string toAttribute = r["ToAttribute"]?.ToString() ?? "";
+                    string fromEntityName = ToPascal(fromEntityLogical);
+                    string toEntityName = ToPascal(toEntityLogical);
+
+                    if (string.IsNullOrWhiteSpace(fromEntityName) ||
+                        string.IsNullOrWhiteSpace(toEntityName) ||
+                        string.IsNullOrWhiteSpace(fromAttribute) ||
+                        string.IsNullOrWhiteSpace(toAttribute))
+                    {
+                        continue;
+                    }
+
+                    ((JArray)manifest["relationships"]!).Add(new JObject
+                    {
+                        ["fromEntity"] = $"{fromEntityName}.cdm.json/{fromEntityName}",
+                        ["fromEntityAttribute"] = fromAttribute,
+                        ["toEntity"] = $"{toEntityName}.cdm.json/{toEntityName}",
+                        ["toEntityAttribute"] = toAttribute
+                    });
+                }
+            }
+
             string manifestFile = Path.Combine(outputDir, "default.manifest.cdm.json");
             File.WriteAllText(manifestFile, JsonConvert.SerializeObject(manifest, Formatting.Indented));
         }
 
-        // ===== Methodes =====
+        // ===== Helpers =====
+
+        private static bool IncludeByPrefix(string? prefix, string logicalName)
+            => string.IsNullOrWhiteSpace(prefix)
+               || logicalName.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)
+               || logicalName.StartsWith(prefix + "_", StringComparison.OrdinalIgnoreCase);
 
         private static void CopySchemaFilesTo(string destRoot)
         {
@@ -296,7 +462,7 @@ namespace create_manifest
             }
             else
             {
-                Console.WriteLine("⚠️ foundations.cdm.json niet gevonden in needed-files");
+                Console.WriteLine("foundations.cdm.json niet gevonden in needed-files");
             }
 
             // core/cdsConcepts.cdm.json
@@ -310,17 +476,18 @@ namespace create_manifest
             }
             else
             {
-                Console.WriteLine("⚠️ core/cdsConcepts.cdm.json niet gevonden in needed-files");
+                Console.WriteLine("core/cdsConcepts.cdm.json niet gevonden in needed-files");
             }
         }
 
         private static string ToPascal(string logical) =>
             string.IsNullOrEmpty(logical) ? logical : char.ToUpper(logical[0]) + logical[1..];
 
-        //Mapper voor CDM
+        // Mapper voor CDM
         private static string MapToCdmType(string dvType) => dvType switch
         {
-            "Uniqueidentifier" => "string",
+            "Uniqueidentifier" => "guid",
+            "Lookup" => "guid",
             "String" => "string",
             "Memo" => "string",
             "Integer" => "integer",
@@ -334,16 +501,18 @@ namespace create_manifest
         };
     }
 
-    // ===== Modelklassen voor solution-export ===== 
+    // ===== Modelklassen voor solution-export =====
     public class SolutionExport
     {
         public string SolutionName { get; set; } = "";
         public List<SolutionEntity> Entities { get; set; } = new();
+        public List<SolutionRelationship> Relationships { get; set; } = new();
     }
 
     public class SolutionEntity
     {
         public string LogicalName { get; set; } = "";
+        public string PrimaryId { get; set; } = "";
         public List<SolutionAttribute> Attributes { get; set; } = new();
     }
 
@@ -351,5 +520,30 @@ namespace create_manifest
     {
         public string Name { get; set; } = "";
         public string Type { get; set; } = "";
+    }
+
+    public class SolutionRelationship
+    {
+        public string Name { get; set; } = "";
+        public string FromEntity { get; set; } = "";
+        public string FromAttribute { get; set; } = "";
+        public string ToEntity { get; set; } = "";
+        public string ToAttribute { get; set; } = "";
+    }
+
+    class TupleStringIgnoreCaseComparer : IEqualityComparer<(string entity, string attr)>
+    {
+        public bool Equals((string entity, string attr) x, (string entity, string attr) y)
+        {
+            return string.Equals(x.entity, y.entity, StringComparison.OrdinalIgnoreCase)
+                && string.Equals(x.attr, y.attr, StringComparison.OrdinalIgnoreCase);
+        }
+
+        public int GetHashCode((string entity, string attr) obj)
+        {
+            int h1 = StringComparer.OrdinalIgnoreCase.GetHashCode(obj.entity ?? "");
+            int h2 = StringComparer.OrdinalIgnoreCase.GetHashCode(obj.attr ?? "");
+            return HashCode.Combine(h1, h2);
+        }
     }
 }
