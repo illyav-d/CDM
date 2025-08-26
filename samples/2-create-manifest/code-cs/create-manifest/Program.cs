@@ -32,7 +32,16 @@ namespace create_manifest
             ("ccp",  "Valantic"),
             ("sgw",  "Sint-Gillis-Waas"),
             ("ccsp", "BeginPrefix"),
-            ("qbx",  "Qubix")
+            ("qbx",  "Qubix"),
+            ("msdyn","MS Dynamics"),
+            ("msdynce","MS Dynamics Customer"),
+            ("msdyncrm","MS Dynamics CRM"),
+            ("msdynmkt","MS Dynamics Marketting"),
+            ("msfp","MS Forms Pro"),
+            ("mspcat","MS Solution Package Catalogue"),
+            ("aal", "Aalter"),
+            ("lb", "LB365 Algemeen"),
+            ("mspp","MS Power Pages")
         };
 
         static async Task Main(string[] args)
@@ -50,10 +59,13 @@ namespace create_manifest
             for (int i = 0; i < Suppliers.Count; i++)
                 Console.WriteLine($"  {i + 2}) Prefix: {Suppliers[i].Prefix} ({Suppliers[i].Label})");
             Console.Write("Maak je keuze (getal): ");
+            string? input = Console.ReadLine();
+            if (!int.TryParse(input, out int choice))
+            {
+                Console.WriteLine("Ongeldige invoer — standaard: Alle entiteiten.");
+                choice = 1;
+            }
 
-            var key = Console.ReadKey(); Console.WriteLine();
-            int choice = char.IsDigit(key.KeyChar) ? (key.KeyChar - '0') : 1;
-            Console.WriteLine();
 
             string? prefix = null;
             string suffix;
