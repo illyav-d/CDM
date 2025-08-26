@@ -8,7 +8,6 @@ namespace create_manifest
     using Newtonsoft.Json.Linq;
     using System;
     using System.Collections.Generic;
-    using System.Globalization;
     using System.IO;
     using System.Linq;
     using System.Text;
@@ -23,7 +22,30 @@ namespace create_manifest
         private static readonly string DomainMappingFile = Path.Combine(SchemaFilesSource, "domain-mapping.csv");
         private const string SchemaVersion = "1.1.0";
 
-        // Leveranciers (oude werkwijze, behouden)
+        private static readonly string[] AllDomains =
+        {
+            "GENERAL",
+            "MELDINGEN",
+            "KLACHTEN",
+            "POSTREGISTRATIE",
+            "WEBCONTENT",
+            "IPDC",
+            "PRODUCTENCATALOGUS P30",
+            "CONTRACTEN",
+            "SUBSIDIES",
+            "PROCESMANAGER",
+            "VERGADERAPP",
+            "FUNCTIONERING",
+            "VERGOEDING",
+            "VERGADERBEHEER",
+            "BEHEER VAN ZAKEN EN DOSSIERS",
+            "CCSP ORGANISATIES",
+            "CCSP CONTACTPERSONEN",
+            "CCSP PERSONEN",
+            "EVENEMENTEN",
+            "INNAME OPENBAAR DOMEIN"
+        };
+
         static readonly List<(string Prefix, string Label)> Suppliers = new()
         {
             ("nrq",  "Norriq"),
@@ -51,10 +73,9 @@ namespace create_manifest
             Console.WriteLine($"SchemaFilesSource: {SchemaFilesSource}");
             Console.WriteLine();
 
-            // Menu
             Console.WriteLine("Stap 1: Ophalen metadata uit Dataverse en wegschrijven (gefilterd)");
             Console.WriteLine("Kies wat je wil exporteren:");
-            Console.WriteLine("  1) Alle entiteiten (met domain-mapping)");
+            Console.WriteLine("  1) Alle entiteiten (met domain-mapping + manifests)");
             for (int i = 0; i < Suppliers.Count; i++)
                 Console.WriteLine($"  {i + 2}) Prefix: {Suppliers[i].Prefix} ({Suppliers[i].Label})");
             Console.Write("Maak je keuze (getal): ");
@@ -71,7 +92,7 @@ namespace create_manifest
 
             if (choice == 1)
             {
-                prefix = null; // alles
+                prefix = null;
                 suffix = "all";
                 useDomainMapping = true;
             }
@@ -97,6 +118,13 @@ namespace create_manifest
 
             CopySchemaFilesTo(outDir);
 
+            if (useDomainMapping)
+            {
+                var lb365Root = Path.Combine(outDir, "LB365");
+                EnsureEmptyDirectory(lb365Root);
+                PrecreateDomainFolders(lb365Root);
+            }
+
             string exportPath = Path.Combine(outDir, $"entities-{suffix}.json");
 
             string connectionString = PromptConnectionStringIfEmpty("");
@@ -107,15 +135,15 @@ namespace create_manifest
                 return;
             }
 
-            Console.WriteLine("Stap 2: Manifest maken vanuit gefilterde export");
+            Console.WriteLine("Stap 2: Manifest/entiteiten genereren vanuit export");
             if (useDomainMapping && File.Exists(DomainMappingFile))
             {
                 var mapping = LoadDomainMapping(DomainMappingFile);
-                GenerateCdmWithDomains(exportPath, outDir, SchemaVersion, mapping);
+                GenerateCdmWithDomainsAndManifests(exportPath, outDir, SchemaVersion, mapping);
             }
             else
             {
-                GenerateCdmFromSolutionExport(exportPath, outDir, SchemaVersion);
+                GenerateFlatCdmWithManifest(exportPath, outDir, SchemaVersion);
             }
 
             Console.WriteLine();
@@ -123,7 +151,6 @@ namespace create_manifest
             Console.WriteLine();
         }
 
-        // Zorgt dat een map leeg is
         private static void EnsureEmptyDirectory(string path)
         {
             if (Directory.Exists(path))
@@ -168,9 +195,12 @@ namespace create_manifest
 
             var request = new Microsoft.Xrm.Sdk.Messages.RetrieveAllEntitiesRequest()
             {
-                EntityFilters = Microsoft.Xrm.Sdk.Metadata.EntityFilters.Entity | Microsoft.Xrm.Sdk.Metadata.EntityFilters.Attributes | Microsoft.Xrm.Sdk.Metadata.EntityFilters.Relationships,
+                EntityFilters = Microsoft.Xrm.Sdk.Metadata.EntityFilters.Entity
+                              | Microsoft.Xrm.Sdk.Metadata.EntityFilters.Attributes
+                              | Microsoft.Xrm.Sdk.Metadata.EntityFilters.Relationships,
                 RetrieveAsIfPublished = true
             };
+
             var response = (Microsoft.Xrm.Sdk.Messages.RetrieveAllEntitiesResponse)serviceClient.Execute(request);
 
             int total = 0, matched = 0;
@@ -206,11 +236,13 @@ namespace create_manifest
             {
                 foreach (var rel in em.OneToManyRelationships ?? Array.Empty<Microsoft.Xrm.Sdk.Metadata.OneToManyRelationshipMetadata>())
                 {
-                    if (!IncludeByPrefix(prefixFilter, rel.ReferencingEntity ?? "")) continue;
+                    string referencingEntity = rel.ReferencingEntity ?? "";
+                    if (!IncludeByPrefix(prefixFilter, referencingEntity)) continue;
+
                     solutionExport.Relationships.Add(new SolutionRelationship
                     {
                         Name = rel.SchemaName ?? "",
-                        FromEntity = rel.ReferencingEntity ?? "",
+                        FromEntity = referencingEntity,
                         FromAttribute = rel.ReferencingAttribute ?? "",
                         ToEntity = rel.ReferencedEntity ?? "",
                         ToAttribute = rel.ReferencedAttribute ?? ""
@@ -235,115 +267,501 @@ namespace create_manifest
             return true;
         }
 
-        // ====== Domain Mapping Loader ======
         private static Dictionary<string, (string Domain, string Category)> LoadDomainMapping(string path)
         {
             var result = new Dictionary<string, (string, string)>(StringComparer.OrdinalIgnoreCase);
-            foreach (var line in File.ReadAllLines(path).Skip(1))
+            var lines = File.ReadAllLines(path, Encoding.UTF8).Where(l => !string.IsNullOrWhiteSpace(l)).ToList();
+            if (lines.Count <= 1) return result;
+
+            foreach (var line in lines.Skip(1))
             {
-                var parts = line.Split(',');
+                var parts = SplitCsvLine(line);
                 if (parts.Length < 3) continue;
                 string logical = parts[0].Trim();
                 string domain = parts[1].Trim();
                 string category = parts[2].Trim();
-                result[logical] = (domain, category);
+                if (!string.IsNullOrEmpty(logical))
+                    result[logical] = (domain, category);
             }
             return result;
         }
 
-        // ====== Generate methods ======
-        private static void GenerateCdmWithDomains(string inputPath, string outputDir, string schemaVersion, Dictionary<string, (string Domain, string Category)> mapping)
+        private static string[] SplitCsvLine(string line)
         {
-            // Maak root manifest LB365
-            string lb365Dir = Path.Combine(outputDir, "LB365");
-            EnsureEmptyDirectory(lb365Dir);
+            var list = new List<string>();
+            var sb = new StringBuilder();
+            bool inQuotes = false;
 
+            for (int i = 0; i < line.Length; i++)
+            {
+                char c = line[i];
+                if (inQuotes)
+                {
+                    if (c == '"' && i + 1 < line.Length && line[i + 1] == '"')
+                    {
+                        sb.Append('"'); i++;
+                    }
+                    else if (c == '"')
+                    {
+                        inQuotes = false;
+                    }
+                    else
+                    {
+                        sb.Append(c);
+                    }
+                }
+                else
+                {
+                    if (c == ',')
+                    {
+                        list.Add(sb.ToString());
+                        sb.Clear();
+                    }
+                    else if (c == '"')
+                    {
+                        inQuotes = true;
+                    }
+                    else
+                    {
+                        sb.Append(c);
+                    }
+                }
+            }
+            list.Add(sb.ToString());
+            return list.ToArray();
+        }
+
+        // =========================
+        // MANIFEST GENERATION (ALL)
+        // =========================
+
+        private static void GenerateCdmWithDomainsAndManifests(
+            string inputPath,
+            string outDir,
+            string schemaVersion,
+            Dictionary<string, (string Domain, string Category)> mapping)
+        {
+            string lb365Dir = Path.Combine(outDir, "LB365");
             var json = JObject.Parse(File.ReadAllText(inputPath));
             var entities = (JArray)json["Entities"]!;
+            var rels = (JArray?)json["Relationships"] ?? new JArray();
 
-            // Groepeer per domein+category
             var grouped = new Dictionary<(string Domain, string Category), List<JToken>>();
             foreach (var entity in entities)
             {
                 string logical = entity["LogicalName"]!.ToString();
-                if (mapping.TryGetValue(logical, out var map))
+                (string Domain, string Category) place;
+                if (!mapping.TryGetValue(logical, out place))
                 {
-                    grouped.TryAdd(map, new List<JToken>());
-                    grouped[map].Add(entity);
+                    place = ("GENERAL", "Custom");
                 }
-                else
+                if (!AllDomains.Contains(place.Domain, StringComparer.OrdinalIgnoreCase))
                 {
-                    grouped.TryAdd(("GENERAL", "Custom"), new List<JToken>());
-                    grouped[("GENERAL", "Custom")].Add(entity);
+                    place = ("GENERAL", place.Category);
                 }
+                grouped.TryAdd(place, new List<JToken>());
+                grouped[place].Add(entity);
             }
 
-            // Maak submappen
-            foreach (var kvp in grouped)
+            var domainManifests = new List<(string Domain, string ManifestFile)>();
+
+            foreach (var domain in AllDomains)
             {
-                string domain = kvp.Key.Domain;
-                string category = kvp.Key.Category;
-                string domainDir = Path.Combine(lb365Dir, domain, category);
-                Directory.CreateDirectory(domainDir);
+                string domainDir = Path.Combine(lb365Dir, domain);
+                string stdDir = Path.Combine(domainDir, "Standard");
+                string cusDir = Path.Combine(domainDir, "Custom");
 
-                foreach (var entity in kvp.Value)
-                {
-                    string logical = entity["LogicalName"]!.ToString();
-                    string entityName = ToPascal(logical);
-                    string entityFile = Path.Combine(domainDir, $"{entityName}.cdm.json");
+                Directory.CreateDirectory(stdDir);
+                Directory.CreateDirectory(cusDir);
 
-                    File.WriteAllText(entityFile, JsonConvert.SerializeObject(new
-                    {
-                        $schema = "cdm:/schema.cdm.json",
-                        jsonSchemaSemanticVersion = schemaVersion,
-                        imports = new[] { new { corpusPath = "cdm:/foundations.cdm.json" } },
-                        definitions = new[] {
-                            new {
-                                entityName = entityName,
-                                extendsEntity = new { entityReference = "CdmEntity" },
-                                hasAttributes = ((JArray)entity["Attributes"]!).Select(a => new {
-                                    name = a["Name"]!.ToString(),
-                                    dataType = new { dataTypeReference = MapToCdmType(a["Type"]?.ToString() ?? "String") }
-                                }).ToArray()
-                            }
-                        }
-                    }, Formatting.Indented));
-                }
+                CopySchemaFilesTo(stdDir);
+                CopySchemaFilesTo(cusDir);
+
+                var stdEntities = grouped.TryGetValue((domain, "Standard"), out var s) ? s : new List<JToken>();
+                var cusEntities = grouped.TryGetValue((domain, "Custom"), out var c) ? c : new List<JToken>();
+
+                string stdManifest = Path.Combine(stdDir, "Standard.manifest.cdm.json");
+                string cusManifest = Path.Combine(cusDir, "Custom.manifest.cdm.json");
+
+                WriteLeafManifestWithEntities(stdDir, stdEntities, schemaVersion, stdManifest, "Standard", rels);
+                WriteLeafManifestWithEntities(cusDir, cusEntities, schemaVersion, cusManifest, "Custom", rels);
+
+                string domainManifestPath = Path.Combine(domainDir, $"{domain}.manifest.cdm.json");
+                WriteDomainManifest(domainManifestPath, schemaVersion, stdDir, cusDir, stdEntities, cusEntities, rels);
+
+                domainManifests.Add((domain, domainManifestPath));
             }
 
-            Console.WriteLine("Submanifesten gegenereerd per domain-mapping.");
+            string lbRootManifest = Path.Combine(lb365Dir, "LB365.manifest.cdm.json");
+            WriteRootManifest(lbRootManifest, schemaVersion, domainManifests);
         }
 
-        private static void GenerateCdmFromSolutionExport(string inputPath, string outputDir, string schemaVersion)
+        private static void WriteLeafManifestWithEntities(
+            string folder,
+            List<JToken> entities,
+            string schemaVersion,
+            string manifestPath,
+            string leafName,
+            JArray? allRels)
         {
-            // oude werkwijze (1 manifest, 1 map)
+            var manifest = new JObject
+            {
+                ["manifestName"] = leafName,
+                ["jsonSchemaSemanticVersion"] = schemaVersion,
+                ["entities"] = new JArray(),
+                ["relationships"] = new JArray(),
+                ["imports"] = new JArray
+                {
+                    new JObject { ["corpusPath"] = "cdm:/core/cdsConcepts.cdm.json" },
+                    new JObject { ["corpusPath"] = "cdm:/foundations.cdm.json" }
+                }
+            };
+
+            var inLeaf = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            foreach (var entity in entities)
+            {
+                string logical = entity["LogicalName"]!.ToString();
+                inLeaf.Add(logical);
+                string entityName = ToPascal(logical);
+                string primaryId = (entity["PrimaryId"]?.ToString() ?? "").Trim();
+
+                var attrs = new JArray();
+                var csvHeader = new StringBuilder();
+                foreach (var a in (JArray)entity["Attributes"]!)
+                {
+                    string name = a["Name"]!.ToString();
+                    string type = a["Type"]?.ToString() ?? "String";
+
+                    attrs.Add(new JObject
+                    {
+                        ["name"] = name,
+                        ["dataType"] = new JObject { ["dataTypeReference"] = MapToCdmType(type) }
+                    });
+
+                    if (csvHeader.Length > 0) csvHeader.Append(',');
+                    csvHeader.Append(name);
+                }
+
+                var entityDef = new JObject
+                {
+                    ["entityName"] = entityName,
+                    ["extendsEntity"] = new JObject { ["entityReference"] = "CdmEntity" },
+                    ["hasAttributes"] = attrs
+                };
+
+                if (!string.IsNullOrWhiteSpace(primaryId))
+                {
+                    entityDef["exhibitsTraits"] = new JArray(
+                        new JObject
+                        {
+                            ["traitReference"] = "is.identifiedBy",
+                            ["arguments"] = new JArray(
+                                new JObject
+                                {
+                                    ["name"] = "attribute",
+                                    ["value"] = new JObject
+                                    {
+                                        ["entityName"] = entityName,
+                                        ["attributeName"] = primaryId
+                                    }
+                                }
+                            )
+                        }
+                    );
+                }
+
+                var entityDoc = new JObject(
+                    new JProperty("$schema", "cdm:/schema.cdm.json"),
+                    new JProperty("jsonSchemaSemanticVersion", schemaVersion),
+                    new JProperty("imports", new JArray(new JObject { ["corpusPath"] = "cdm:/foundations.cdm.json" })),
+                    new JProperty("definitions", new JArray(entityDef))
+                );
+
+                string entityFile = Path.Combine(folder, $"{entityName}.cdm.json");
+                File.WriteAllText(entityFile, JsonConvert.SerializeObject(entityDoc, Formatting.Indented));
+
+                string entityFolder = Path.Combine(folder, entityName);
+                Directory.CreateDirectory(entityFolder);
+                File.WriteAllText(Path.Combine(entityFolder, "partition-data.csv"), csvHeader + Environment.NewLine);
+
+                ((JArray)manifest["entities"]!).Add(new JObject
+                {
+                    ["type"] = "LocalEntity",
+                    ["entityName"] = entityName,
+                    ["entityPath"] = $"{entityName}.cdm.json/{entityName}",
+                    ["dataPartitions"] = new JArray(
+                        new JObject
+                        {
+                            ["name"] = $"{entityName}-data",
+                            ["location"] = $"{entityName}/partition-data.csv",
+                            ["appliedTraits"] = new JArray(
+                                new JObject
+                                {
+                                    ["traitReference"] = "is.partition.format.CSV",
+                                    ["arguments"] = new JArray(
+                                        new JObject { ["name"] = "columnHeaders", ["value"] = "true" },
+                                        new JObject { ["name"] = "delimiter", ["value"] = "," }
+                                    )
+                                }
+                            )
+                        }
+                    )
+                });
+            }
+
+            if (allRels != null && allRels.Count > 0)
+            {
+                foreach (var r in allRels)
+                {
+                    string fromLogical = r["FromEntity"]?.ToString() ?? "";
+                    string toLogical = r["ToEntity"]?.ToString() ?? "";
+                    if (!inLeaf.Contains(fromLogical) || !inLeaf.Contains(toLogical))
+                        continue;
+
+                    string fromEntity = ToPascal(fromLogical);
+                    string toEntity = ToPascal(toLogical);
+                    string fromAttr = r["FromAttribute"]?.ToString() ?? "";
+                    string toAttr = r["ToAttribute"]?.ToString() ?? "";
+                    if (string.IsNullOrWhiteSpace(fromAttr) || string.IsNullOrWhiteSpace(toAttr))
+                        continue;
+
+                    ((JArray)manifest["relationships"]!).Add(new JObject
+                    {
+                        ["fromEntity"] = $"{fromEntity}.cdm.json/{fromEntity}",
+                        ["fromEntityAttribute"] = fromAttr,
+                        ["toEntity"] = $"{toEntity}.cdm.json/{toEntity}",
+                        ["toEntityAttribute"] = toAttr
+                    });
+                }
+            }
+
+            File.WriteAllText(manifestPath, JsonConvert.SerializeObject(manifest, Formatting.Indented));
+        }
+
+        private static void WriteDomainManifest(
+            string manifestPath,
+            string schemaVersion,
+            string stdDir,
+            string cusDir,
+            List<JToken> stdEntities,
+            List<JToken> cusEntities,
+            JArray allRels)
+        {
+            string stdRel = ToCorpusPath(manifestPath, Path.Combine(stdDir, "Standard.manifest.cdm.json"));
+            string cusRel = ToCorpusPath(manifestPath, Path.Combine(cusDir, "Custom.manifest.cdm.json"));
+
+            var manifest = new JObject
+            {
+                ["manifestName"] = Path.GetFileNameWithoutExtension(manifestPath).Replace(".manifest", ""),
+                ["jsonSchemaSemanticVersion"] = schemaVersion,
+                ["imports"] = new JArray
+                {
+                    new JObject { ["corpusPath"] = "cdm:/core/cdsConcepts.cdm.json" },
+                    new JObject { ["corpusPath"] = "cdm:/foundations.cdm.json" }
+                },
+                ["subManifests"] = new JArray
+                {
+                    new JObject { ["manifestName"] = "Standard", ["definition"] = stdRel },
+                    new JObject { ["manifestName"] = "Custom",   ["definition"] = cusRel }
+                },
+                ["relationships"] = new JArray()
+            };
+
+            var stdSet = new HashSet<string>(stdEntities.Select(e => e["LogicalName"]!.ToString()), StringComparer.OrdinalIgnoreCase);
+            var cusSet = new HashSet<string>(cusEntities.Select(e => e["LogicalName"]!.ToString()), StringComparer.OrdinalIgnoreCase);
+            bool Has(string logical) => stdSet.Contains(logical) || cusSet.Contains(logical);
+
+            string PathFor(string logical)
+            {
+                string pascal = ToPascal(logical);
+                if (stdSet.Contains(logical))
+                    return $"Standard/{pascal}.cdm.json/{pascal}";
+                if (cusSet.Contains(logical))
+                    return $"Custom/{pascal}.cdm.json/{pascal}";
+                return $"{pascal}.cdm.json/{pascal}";
+            }
+
+            foreach (var r in allRels)
+            {
+                string fromLogical = r["FromEntity"]?.ToString() ?? "";
+                string toLogical = r["ToEntity"]?.ToString() ?? "";
+                if (!Has(fromLogical) || !Has(toLogical)) continue;
+
+                string fromAttr = r["FromAttribute"]?.ToString() ?? "";
+                string toAttr = r["ToAttribute"]?.ToString() ?? "";
+                if (string.IsNullOrWhiteSpace(fromAttr) || string.IsNullOrWhiteSpace(toAttr)) continue;
+
+                ((JArray)manifest["relationships"]!).Add(new JObject
+                {
+                    ["fromEntity"] = PathFor(fromLogical),
+                    ["fromEntityAttribute"] = fromAttr,
+                    ["toEntity"] = PathFor(toLogical),
+                    ["toEntityAttribute"] = toAttr
+                });
+            }
+
+            File.WriteAllText(manifestPath, JsonConvert.SerializeObject(manifest, Formatting.Indented));
+        }
+
+        private static void WriteRootManifest(string manifestPath, string schemaVersion, List<(string Domain, string ManifestFile)> domainManifests)
+        {
+            var subs = new JArray();
+            foreach (var (Domain, ManifestFile) in domainManifests)
+            {
+                string rel = ToCorpusPath(manifestPath, ManifestFile);
+                subs.Add(new JObject { ["manifestName"] = Domain, ["definition"] = rel });
+            }
+
+            var manifest = new JObject
+            {
+                ["manifestName"] = "LB365",
+                ["jsonSchemaSemanticVersion"] = schemaVersion,
+                ["imports"] = new JArray
+                {
+                    new JObject { ["corpusPath"] = "cdm:/core/cdsConcepts.cdm.json" },
+                    new JObject { ["corpusPath"] = "cdm:/foundations.cdm.json" }
+                },
+                ["subManifests"] = subs
+            };
+
+            File.WriteAllText(manifestPath, JsonConvert.SerializeObject(manifest, Formatting.Indented));
+        }
+
+        private static string MakeRelative(string fromFile, string toFile)
+        {
+            var from = new Uri(Path.GetFullPath(fromFile));
+            var to = new Uri(Path.GetFullPath(toFile));
+            return Uri.UnescapeDataString(from.MakeRelativeUri(to).ToString()).Replace('/', Path.DirectorySeparatorChar);
+        }
+
+        // =============================
+        // Leverancier
+        // =============================
+
+        private static void GenerateFlatCdmWithManifest(string inputPath, string outputDir, string schemaVersion)
+        {
             var json = JObject.Parse(File.ReadAllText(inputPath));
             var entities = (JArray)json["Entities"]!;
+
+            var manifest = new JObject
+            {
+                ["manifestName"] = "default",
+                ["jsonSchemaSemanticVersion"] = schemaVersion,
+                ["entities"] = new JArray(),
+                ["imports"] = new JArray
+                {
+                    new JObject { ["corpusPath"] = "cdm:/core/cdsConcepts.cdm.json" },
+                    new JObject { ["corpusPath"] = "cdm:/foundations.cdm.json" }
+                }
+            };
+
             foreach (var entityNode in entities)
             {
                 string logicalName = entityNode["LogicalName"]!.ToString();
                 string entityName = ToPascal(logicalName);
-                string entityFile = Path.Combine(outputDir, $"{entityName}.cdm.json");
-                File.WriteAllText(entityFile, JsonConvert.SerializeObject(new
+                string primaryId = (entityNode["PrimaryId"]?.ToString() ?? "").Trim();
+
+                var attrs = new JArray();
+                var csvHeader = new StringBuilder();
+
+                foreach (var a in (JArray)entityNode["Attributes"]!)
                 {
-                    $schema = "cdm:/schema.cdm.json",
-                    jsonSchemaSemanticVersion = schemaVersion,
-                    imports = new[] { new { corpusPath = "cdm:/foundations.cdm.json" } },
-                    definitions = new[] {
-                        new {
-                            entityName = entityName,
-                            extendsEntity = new { entityReference = "CdmEntity" },
-                            hasAttributes = ((JArray)entityNode["Attributes"]!).Select(a => new {
-                                name = a["Name"]!.ToString(),
-                                dataType = new { dataTypeReference = MapToCdmType(a["Type"]?.ToString() ?? "String") }
-                            }).ToArray()
+                    string name = a["Name"]!.ToString();
+                    string type = a["Type"]?.ToString() ?? "String";
+                    attrs.Add(new JObject
+                    {
+                        ["name"] = name,
+                        ["dataType"] = new JObject { ["dataTypeReference"] = MapToCdmType(type) }
+                    });
+                    if (csvHeader.Length > 0) csvHeader.Append(',');
+                    csvHeader.Append(name);
+                }
+
+                var entityDef = new JObject
+                {
+                    ["entityName"] = entityName,
+                    ["extendsEntity"] = new JObject { ["entityReference"] = "CdmEntity" },
+                    ["hasAttributes"] = attrs
+                };
+
+                if (!string.IsNullOrWhiteSpace(primaryId))
+                {
+                    entityDef["exhibitsTraits"] = new JArray(
+                        new JObject
+                        {
+                            ["traitReference"] = "is.identifiedBy",
+                            ["arguments"] = new JArray(
+                                new JObject
+                                {
+                                    ["name"] = "attribute",
+                                    ["value"] = new JObject
+                                    {
+                                        ["entityName"] = entityName,
+                                        ["attributeName"] = primaryId
+                                    }
+                                }
+                            )
                         }
-                    }
-                }, Formatting.Indented));
+                    );
+                }
+
+                var entityDoc = new JObject(
+                    new JProperty("$schema", "cdm:/schema.cdm.json"),
+                    new JProperty("jsonSchemaSemanticVersion", schemaVersion),
+                    new JProperty("imports", new JArray(new JObject { ["corpusPath"] = "cdm:/foundations.cdm.json" })),
+                    new JProperty("definitions", new JArray(
+                        entityDef
+                    ))
+                );
+
+                string entityFile = Path.Combine(outputDir, $"{entityName}.cdm.json");
+                File.WriteAllText(entityFile, JsonConvert.SerializeObject(entityDoc, Formatting.Indented));
+
+                string entityFolder = Path.Combine(outputDir, entityName);
+                Directory.CreateDirectory(entityFolder);
+                File.WriteAllText(Path.Combine(entityFolder, "partition-data.csv"), csvHeader.ToString() + Environment.NewLine);
+
+                ((JArray)manifest["entities"]!).Add(new JObject
+                {
+                    ["type"] = "LocalEntity",
+                    ["entityName"] = entityName,
+                    ["entityPath"] = $"{entityName}.cdm.json/{entityName}",
+                    ["dataPartitions"] = new JArray(
+                        new JObject
+                        {
+                            ["name"] = $"{entityName}-data",
+                            ["location"] = $"{entityName}/partition-data.csv",
+                            ["appliedTraits"] = new JArray(
+                                new JObject
+                                {
+                                    ["traitReference"] = "is.partition.format.CSV",
+                                    ["arguments"] = new JArray(
+                                        new JObject { ["name"] = "columnHeaders", ["value"] = "true" },
+                                        new JObject { ["name"] = "delimiter", ["value"] = "," }
+                                    )
+                                }
+                            )
+                        }
+                    )
+                });
             }
+
+            string manifestFile = Path.Combine(outputDir, "default.manifest.cdm.json");
+            File.WriteAllText(manifestFile, JsonConvert.SerializeObject(manifest, Formatting.Indented));
         }
 
         // ===== Helpers =====
+
+        private static void PrecreateDomainFolders(string lb365Root)
+        {
+            foreach (var dom in AllDomains)
+            {
+                Directory.CreateDirectory(Path.Combine(lb365Root, dom, "Standard"));
+                Directory.CreateDirectory(Path.Combine(lb365Root, dom, "Custom"));
+            }
+            Console.WriteLine("Vooraf alle LB365 domeinmappen (Standard/Custom) aangemaakt.");
+        }
 
         private static bool IncludeByPrefix(string? prefix, string logicalName)
             => string.IsNullOrWhiteSpace(prefix)
@@ -381,6 +799,14 @@ namespace create_manifest
             "DateTime" => "dateTime",
             _ => "string"
         };
+
+        private static string ToCorpusPath(string fromFile, string toFile)
+        {
+            var from = new Uri(Path.GetFullPath(fromFile));
+            var to = new Uri(Path.GetFullPath(toFile));
+            var rel = Uri.UnescapeDataString(from.MakeRelativeUri(to).ToString());
+            return rel.Replace('\\', '/');
+        }
     }
 
     public class SolutionExport
