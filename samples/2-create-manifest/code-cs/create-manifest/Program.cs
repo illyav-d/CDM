@@ -231,28 +231,90 @@ namespace create_manifest
                     Attributes = attributes
                 });
             }
+            // Set van geselecteerde entiteiten (voor relatie-filter)
+            var selected = new HashSet<string>(
+                solutionExport.Entities.ConvertAll(e => e.LogicalName),
+                StringComparer.OrdinalIgnoreCase
+            );
 
+            // --- Relationships (1:N en N:1) ---
+            // Exporteer: zodra FROM-entity in subset zit (oude gedrag).
+            // Log ook apart: hoeveel relaties zijn intern (beide kanten in subset).
+            int o2mCount = 0, m2oCount = 0, skippedIncomplete = 0;
+
+            // Dedup sets
+            var relSetFromOnly = new HashSet<string>(StringComparer.OrdinalIgnoreCase); // voor export/telling FROM in subset
+            var relSetInternal = new HashSet<string>(StringComparer.OrdinalIgnoreCase); // voor telling BEIDE in subset
+
+            int exportedFromOnly = 0; // aantal unieke relaties die we effectief exporteren (FROM in subset)
+            int internalOnly = 0; // aantal unieke relaties waarvan beide kanten in subset zitten
+            int dedupFromOnly = 0; // dedups op FROM in subset
+            int dedupInternal = 0; // dedups op BEIDE in subset
+
+            void HandleRel(Microsoft.Xrm.Sdk.Metadata.OneToManyRelationshipMetadata rel)
+            {
+                string fe = rel.ReferencingEntity ?? "";
+                string te = rel.ReferencedEntity ?? "";
+                string fa = rel.ReferencingAttribute ?? "";
+                string ta = rel.ReferencedAttribute ?? "";
+                string name = rel.SchemaName ?? "";
+
+                if (string.IsNullOrWhiteSpace(fe) || string.IsNullOrWhiteSpace(te) ||
+                    string.IsNullOrWhiteSpace(fa) || string.IsNullOrWhiteSpace(ta))
+                { skippedIncomplete++; return; }
+
+                string key = $"{fe}|{fa}|{te}|{ta}";
+
+                // Telling: interne relatie (beide kanten in subset)
+                if (selected.Contains(fe) && selected.Contains(te))
+                {
+                    if (!relSetInternal.Add(key)) dedupInternal++;
+                    else internalOnly++;
+                }
+
+                // Export + telling: FROM moet in subset zitten (oude gedrag)
+                if (selected.Contains(fe))
+                {
+                    if (!relSetFromOnly.Add(key)) { dedupFromOnly++; return; }
+
+                    solutionExport.Relationships.Add(new SolutionRelationship
+                    {
+                        Name = name,
+                        FromEntity = fe,
+                        FromAttribute = fa,
+                        ToEntity = te,
+                        ToAttribute = ta
+                    });
+                    exportedFromOnly++;
+                }
+            }
+
+            // One-to-Many
             foreach (var em in response.EntityMetadata)
             {
                 foreach (var rel in em.OneToManyRelationships ?? Array.Empty<Microsoft.Xrm.Sdk.Metadata.OneToManyRelationshipMetadata>())
                 {
-                    string referencingEntity = rel.ReferencingEntity ?? "";
-                    if (!IncludeByPrefix(prefixFilter, referencingEntity)) continue;
-
-                    solutionExport.Relationships.Add(new SolutionRelationship
-                    {
-                        Name = rel.SchemaName ?? "",
-                        FromEntity = referencingEntity,
-                        FromAttribute = rel.ReferencingAttribute ?? "",
-                        ToEntity = rel.ReferencedEntity ?? "",
-                        ToAttribute = rel.ReferencedAttribute ?? ""
-                    });
+                    o2mCount++;
+                    HandleRel(rel);
                 }
             }
 
+            // Many-to-One
+            foreach (var em in response.EntityMetadata)
+            {
+                foreach (var rel in em.ManyToOneRelationships ?? Array.Empty<Microsoft.Xrm.Sdk.Metadata.OneToManyRelationshipMetadata>())
+                {
+                    m2oCount++;
+                    HandleRel(rel);
+                }
+            }
+
+            // Logging
+            Console.WriteLine($"Relaties in het Dataverse: One to Many ={o2mCount}, Many To One={m2oCount}, onvolledig={skippedIncomplete}");
+            Console.WriteLine($"Relaties buiten het manifest/set: {exportedFromOnly} (dedup={dedupFromOnly})");
+            Console.WriteLine($"Relaties binnen het manifest/set: {internalOnly} (dedup={dedupInternal})");
+            Console.WriteLine($"Relaties die naar Entity Viewer gaan: {solutionExport.Relationships.Count}");
             Console.WriteLine($"Gefilterd op prefix: {(prefixFilter ?? "<all>")}");
-            Console.WriteLine($"Totaal entiteiten: {total} | Geselecteerd: {matched}");
-            Console.WriteLine($"Relaties verzameld: {solutionExport.Relationships.Count}");
             Console.WriteLine();
 
             if (solutionExport.Entities.Count == 0)
