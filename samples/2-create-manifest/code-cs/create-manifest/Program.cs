@@ -62,7 +62,8 @@ namespace create_manifest
             ("mspcat","MS Solution Package Catalogue"),
             ("aal", "Aalter"),
             ("lb", "LB365 Algemeen"),
-            ("mspp","MS Power Pages")
+            ("mspp","MS Power Pages"),
+            ("leu","Leuven")
         };
 
         static void Main(string[] args)
@@ -394,7 +395,7 @@ namespace create_manifest
         }
 
         // =========================
-        // MANIFEST GENERATION (ALL)
+        // MANIFEST GENERATION (alle entiteiten in dverse)
         // =========================
 
         private static void GenerateCdmWithDomainsAndManifests(
@@ -685,7 +686,7 @@ namespace create_manifest
 
 
         // =============================
-        // Leverancier
+        // Manifest op prefix van integrator of custom prefix
         // =============================
 
         private static void GenerateFlatCdmWithManifest(string inputPath, string outputDir, string schemaVersion)
@@ -863,7 +864,7 @@ namespace create_manifest
             File.WriteAllText(manifestFile, JsonConvert.SerializeObject(manifest, Formatting.Indented));
         }
 
-        // Helper comparer (staat waarschijnlijk al in je code)
+        // ===== Helpers =====
         class TupleStringIgnoreCaseComparer : IEqualityComparer<(string entity, string attr)>
         {
             public bool Equals((string entity, string attr) x, (string entity, string attr) y)
@@ -878,7 +879,7 @@ namespace create_manifest
         }
 
 
-        // ===== Helpers =====
+       
 
         private static void PrecreateDomainFolders(string lb365Root)
         {
@@ -936,6 +937,7 @@ namespace create_manifest
         }
     }
 
+    //Classes om te exporten.
     public class SolutionExport
     {
         public string SolutionName { get; set; } = "";
